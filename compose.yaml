@@ -1,0 +1,48 @@
+x-image: &image
+  image: dashbite:latest
+  build: .
+
+x-runtime: &runtime
+  <<: *image
+  environment:
+    DATA_ROOT: /data
+    TRAIN_EVERY_N_EVENTS: ${TRAIN_EVERY_N_EVENTS:-50}
+    BATCH_SIZE: ${BATCH_SIZE:-20}
+    POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-15}
+    CORRUPT_BATCH_RATE: ${CORRUPT_BATCH_RATE:-0.25}
+    RANDOM_SEED: ${RANDOM_SEED:-42}
+  volumes:
+    - dashbite-data:/data
+
+services:
+  simulator:
+    <<: *runtime
+    command: ["python", "-m", "pipeline.simulator"]
+
+  preprocess:
+    <<: *runtime
+    command: ["python", "-m", "pipeline.preprocess"]
+
+  train:
+    <<: *runtime
+    command: ["python", "-m", "pipeline.train"]
+
+  infer:
+    <<: *runtime
+    command: ["python", "-m", "pipeline.infer"]
+
+  dashboard:
+    <<: *runtime
+    command: ["streamlit", "run", "pipeline/dashboard/app.py", "--server.headless", "true", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    ports:
+      - "8501:8501"
+
+  tests:
+    <<: *image
+    profiles: ["test"]
+    environment:
+      DATA_ROOT: /tmp/dashbite-test-data
+    command: ["python", "-m", "pytest"]
+
+volumes:
+  dashbite-data:

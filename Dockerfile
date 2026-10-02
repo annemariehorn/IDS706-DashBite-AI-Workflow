@@ -1,0 +1,14 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY pipeline/ pipeline/
+COPY tests/ tests/
+COPY pytest.ini .
+
+CMD ["python", "-m", "pipeline.simulator"]

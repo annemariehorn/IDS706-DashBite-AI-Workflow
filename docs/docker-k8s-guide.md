@@ -1,172 +1,43 @@
-# Dockerizing DashBite & Scaling with Kubernetes
+# Dockerizing DashBite & Future Kubernetes Guidance
 
-Guide for packaging each pipeline stage as a container and scaling those images independently on Kubernetes. This document is a **design/runbook guide** — the repo may still run as local Python processes without Docker installed.
+The repository implements one shared image in [`Dockerfile`](../Dockerfile) and five runtime services plus an isolated test service in [`compose.yaml`](../compose.yaml). See the [README](../README.md#docker-compose) for setup, configuration, persistence checks, and destructive reset commands. Related: [Low-Level Design](./lld-dashbite-ml-pipeline.md).
 
-Related: [Low-Level Design](./lld-dashbite-ml-pipeline.md)
-
----
-
-## Why this pipeline containerizes cleanly
-
-Each stage is already an independent process with a clear entry point and file-based handoffs:
-
-| Stage | Entry point | Reads | Writes |
-|-------|-------------|-------|--------|
-| Simulator | `python -m pipeline.simulator` | — | `data/raw/` |
-| Preprocess | `python -m pipeline.preprocess` | `data/raw/` | `data/features/`, `data/quality/` |
-| Train | `python -m pipeline.train` | `data/features/` | `data/models/` |
-| Infer | `python -m pipeline.infer` | `data/features/`, `data/models/` | `data/predictions/` |
-| Dashboard | `streamlit run pipeline/dashboard/app.py` | features, predictions, quality | — |
-
-Train and infer do **not** import each other. They only share checkpoint files under `data/models/`. That boundary is what lets you run (and later scale) them as separate containers.
-
-```mermaid
-flowchart LR
-  sim[simulator] --> raw[data/raw]
-  raw --> prep[preprocess]
-  prep --> feats[data/features]
-  prep --> qual[data/quality]
-  feats --> train[train]
-  train --> models[data/models]
-  feats --> infer[infer]
-  models --> infer
-  infer --> preds[data/predictions]
-  feats --> dash[dashboard]
-  preds --> dash
-  qual --> dash
-```
-
-**Recommended packaging:** one shared image (`dashbite:latest`), different `command` per service, one shared data volume mounted at a configurable `DATA_ROOT`.
-
----
-
-## Part 1 — How to Dockerize
-
-### 1. Container-friendly data root
-
-Today paths default to `<project>/data`. For containers, support an env override:
-
-- `DATA_ROOT=/app/data` (or `/data`)
-- All stages and the dashboard resolve `raw/`, `features/`, `models/`, `predictions/`, `quality/` under that root
-- Compose/K8s mount one volume there so every container sees the same pipeline state
-
-### 2. Single Dockerfile (many commands)
-
-Use one image for every stage:
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY pipeline/ pipeline/
-ENV PYTHONPATH=/app
-ENV DATA_ROOT=/app/data
-# Command overridden per service in Compose / Kubernetes
-CMD ["python", "-m", "pipeline.simulator"]
-```
-
-Notes:
-
-- Expose port `8501` only for the dashboard service
-- `.dockerignore` should exclude `.venv/`, local `data/`, `.pytest_cache/`, and ideally keep the image free of host test artifacts
-- No multi-stage build required for this teaching stack
-
-### 3. Docker Compose — one service per stage
-
-```yaml
-# Conceptual shape — services share one named volume
-services:
-  simulator:
-    image: dashbite:latest
-    command: python -m pipeline.simulator
-    environment: &pipeline_env
-      DATA_ROOT: /app/data
-      TRAIN_EVERY_N_EVENTS: "50"
-      BATCH_SIZE: "20"
-      POLL_INTERVAL_SECONDS: "15"
-      CORRUPT_BATCH_RATE: "0.25"
-    volumes:
-      - dashbite-data:/app/data
-    restart: unless-stopped
-
-  preprocess:
-    image: dashbite:latest
-    command: python -m pipeline.preprocess
-    environment: *pipeline_env
-    volumes:
-      - dashbite-data:/app/data
-
-  train:
-    image: dashbite:latest
-    command: python -m pipeline.train
-    environment: *pipeline_env
-    volumes:
-      - dashbite-data:/app/data
-
-  infer:
-    image: dashbite:latest
-    command: python -m pipeline.infer
-    environment: *pipeline_env
-    volumes:
-      - dashbite-data:/app/data
-
-  dashboard:
-    image: dashbite:latest
-    command: >
-      streamlit run pipeline/dashboard/app.py
-      --server.address 0.0.0.0 --server.port 8501
-    environment: *pipeline_env
-    volumes:
-      - dashbite-data:/app/data
-    ports:
-      - "8501:8501"
-
-volumes:
-  dashbite-data:
-```
-
-| Service | Scale intent (Compose) |
-|---------|------------------------|
-| `simulator` | Keep at **1** |
-| `preprocess` | Keep at **1** for file-based demo |
-| `train` | Keep at **1** (sole checkpoint writer) |
-| `infer` | Can try `--scale infer=2` for demo; watch for duplicate scoring |
-| `dashboard` | **1**; open http://localhost:8501 |
-
-Typical local commands:
+## Implemented Docker workflow
 
 ```bash
-docker compose up --build -d
-docker compose logs -f preprocess
+docker compose config
+docker compose build
+docker compose --profile test run --rm --no-deps tests
+docker compose up -d
+docker compose ps
+docker compose logs
 docker compose down
 ```
 
-### 4. Environment variables
+| Service | Foreground command | Shared storage |
+| --- | --- | --- |
+| simulator | `python -m pipeline.simulator` | writes `/data/raw` |
+| preprocess | `python -m pipeline.preprocess` | reads raw; writes features and quality |
+| train | `python -m pipeline.train` | reads features; writes models and training state |
+| infer | `python -m pipeline.infer` | reads features and models; writes predictions |
+| dashboard | `streamlit run pipeline/dashboard/app.py` | reads features, predictions, and quality |
+| tests (profile `test`) | `python -m pytest` | ephemeral `/tmp/dashbite-test-data`, no mounts |
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `DATA_ROOT` | `<project>/data` | Shared pipeline data directory |
-| `TRAIN_EVERY_N_EVENTS` | `2000` | Retrain after this many new labeled rows |
-| `BATCH_SIZE` | `50` | Orders per simulator tick |
-| `POLL_INTERVAL_SECONDS` | `15.0` | Sleep between polls/ticks |
-| `CORRUPT_BATCH_RATE` | `0.25` | Fraction of batches with NaNs / bad types |
-| `RANDOM_SEED` | `42` | Training seed |
+The Python 3.13 slim image installs requirements before copying application source, tests, fixtures, and `pytest.ini` to preserve dependency build caching. `.dockerignore` excludes host environments, runtime data, logs, Git metadata, and caches. Foreground exec-form commands allow Docker to manage each process directly. Only the dashboard publishes a port (`8501`) and binds to `0.0.0.0` in headless mode.
 
-### 5. Concurrency caveat (important)
+Every runtime service sets `DATA_ROOT=/data` and mounts the same `dashbite-data` named volume. Without an override, local helpers use `<project>/data`; an empty override is unset, and a nonempty override must be absolute. Explicit test `base` arguments retain `base/data` precedence. No storage setting was added to the `Config` dataclass.
 
-Handoffs use CSV files and simple markers (e.g. preprocess `.done_*`, infer “already scored” filters). **Multiple writers on the same directories can race.**
+Compose demo settings match the Makefile: training threshold 50, batch size 20, polling 15 seconds, corruption rate 0.25, and seed 42. Shell or `.env` values override these numeric settings. Python defaults remain unchanged. Polling handles startup order; a fresh pipeline takes several cycles to create its first checkpoint and predictions.
 
-For Compose demos:
+The tests service shares only the image configuration, has no dependencies or mounts, and returns pytest's status. It can run while application services are absent and cannot alter the live pipeline volume.
 
-- Run **simulator**, **preprocess**, and **train** at 1 replica
-- Treat multi-replica **infer** as experimental until claim/shard logic exists
+`docker compose down` preserves data. Recreating the stack resumes with existing markers, checkpoints, training state, and predictions. `docker compose down --volumes` deliberately deletes this state; use only for disposable data. The image uses its default root user so a fresh named volume is writable by all five runtime services.
 
-Host `pytest` remains the quality gate; containers are a packaging layer on top of the same modules.
+Keep **one instance per runtime stage**, including inference. Existing final-file writes and polling can expose partial reads; concurrent writers require additional coordination. Atomic handoffs, graceful shutdown changes, and dashboard health checks are outside this implementation's scope.
 
 ---
 
-## Part 2 — Kubernetes: scale each image effectively
+## Future guidance — Kubernetes (not implemented)
 
 Use the **same image**, different Deployments and commands. Shared storage is the critical design choice.
 
@@ -320,11 +191,3 @@ modular processes
 That progression shows how the same DashBite stages move from a laptop demo to independently scalable services without rewriting the ML logic.
 
 ---
-
-## Implementation checklist (when you build it)
-
-1. Add `DATA_ROOT` support in `pipeline/paths.py`, config, and dashboard
-2. Add `Dockerfile` + `.dockerignore`
-3. Add `docker-compose.yml` (five services + shared volume)
-4. Document compose commands in the root README
-5. Later: add `k8s/` manifests and claim/shard helpers before HPA &gt; 1 on shared files

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pipeline.config import PROJECT_ROOT
@@ -23,8 +24,16 @@ DATA_SUBDIRS = ("raw", "features", "models", "predictions", "quality")
 
 
 def data_root(base: Path | None = None) -> Path:
-    """Return the data root (default: <project>/data)."""
-    return (base or PROJECT_ROOT) / "data"
+    """Use explicit base/data, absolute DATA_ROOT, or <project>/data."""
+    if base is not None:
+        return base / "data"
+    override = os.environ.get("DATA_ROOT", "")
+    if override:
+        root = Path(override)
+        if not root.is_absolute():
+            raise ValueError("DATA_ROOT must be an absolute path")
+        return root
+    return PROJECT_ROOT / "data"
 
 
 def raw_dir(base: Path | None = None) -> Path:
